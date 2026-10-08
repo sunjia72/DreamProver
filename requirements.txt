@@ -1,0 +1,4 @@
+# Fetch the pinned checkouts first: python scripts/setup_dependencies.py
+# Source installation includes the upstream Python <3.12 TypedDict fix.
+-e ./vendor/kimina-lean-server
+-e .

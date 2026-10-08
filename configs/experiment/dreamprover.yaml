@@ -1,0 +1,40 @@
+name: dreamprover
+prover_llm:
+  base_url: ${oc.env:PROVER_BASE_URL,https://api.openai.com/v1}
+  llm_name: ${oc.env:PROVER_MODEL,gpt-6-luna}
+  max_tokens: 16384
+  prompt_strategy: non_cot
+informal_llm:
+  provider: openai
+  base_url: ${oc.env:REASONER_BASE_URL,https://api.openai.com/v1}
+  model_name: ${oc.env:REASONER_MODEL,gpt-6-luna}
+search_engine:
+  cache_dir: artifacts/retrieval
+  data_file: mathlib_informal.jsonl
+  model_name_or_path: artifacts/models/all-mpnet-base-v2
+  top_k: 5
+enable_retrieval: false
+lemma_library_path: null
+validate_lemma_library: true
+max_depth: 1
+verify_each_subgoal_separately: true
+complexity_proof_length_cutoff: 30
+save_proofs_to_disk: true
+proof_save_dir: ${results_dir}/proofs/
+sequential_processing: false
+run_proof_attempts_sequentially: true
+max_concurrent_problems: 8
+proof_attempt_config:
+  subgoal_decomp_attempts: 4
+  formal_proof_attempts: 4
+  main_theorem_error_corrections: 6
+  subgoal_error_corrections: 6
+  missing_tags_error_corrections: 3
+  parallel_subgoal_proof_attempts: 4
+  proof_sketch_corrections: 6
+  missing_subgoal_extraction_attempts: 3
+  proof_verification_timeout: 120
+  max_prover_llm_calls: null
+  max_reasoner_llm_calls: null
+max_concurrent_requests: 16
+verifier_base_url: http://127.0.0.1:10002
