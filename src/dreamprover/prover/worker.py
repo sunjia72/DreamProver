@@ -13,7 +13,7 @@ from typing import Optional, List, Dict, Tuple, TYPE_CHECKING
 from dreamprover.prover.base import BaseProverLLM
 from dreamprover.prover.config import ProofAttemptConfig
 from dreamprover.prover.tree import ProofTree, SubgoalNode, ProofStatus, ProofStrategy
-from dreamprover.lean.text import extract_lean_block, extract_search_queries, extract_theorems_queries, extract_tag, extract_all_lean_blocks
+from dreamprover.lean.text import extract_lean_block, extract_search_queries, extract_theorems_queries, extract_tag, extract_all_lean_blocks, parse_affirmative_verdict
 from dreamprover.lean.helpers import replace_have_proofs_with_sorry, check_theorem_signature_match, \
     extract_theorem_signature, _remove_comments, extract_theorem_name, extract_proof_body_from_theorem, remove_import_statements, \
     extract_missing_identifiers, extract_all_have_names, _check_for_sorries, _extract_all_theorems_from_string, \
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from dreamprover.lean.retrieval import SemanticSearchEngine
 from dreamprover.lean.library import LemmaLibrary, assert_complete_source
 from dreamprover.runtime.io import safe_problem_filename
-from dreamprover.runtime.jobs import AsyncJobPool
+from dreamprover.runtime.jobs import AsyncJobPool, raise_if_fatal
 from dreamprover.runtime.files import write_string_to_file, make_dirs
 from dreamprover.runtime.statistics import ProofStatistics, StrategyType, LLMType, PromptType, VerificationType
 from dreamprover.runtime.tracking import TrackedAsyncLLMClient, TrackedAsyncProverLLM, StrategyTracker, TrackedAsyncLeanVerifier
@@ -845,7 +845,7 @@ class HILBERTWorker:
             context=f"Theorem: {theorem}"
         )
         
-        if 'YES' in informal_response:
+        if parse_affirmative_verdict(informal_response):
             logger.info("The subgoal is mathematically correct! Full response:")
             logger.info(informal_response)
         else:
@@ -866,7 +866,7 @@ class HILBERTWorker:
             context=f"Theorem: {theorem}"
         )
         
-        if 'YES' in informal_response:
+        if parse_affirmative_verdict(informal_response):
             logger.info("The subgoal is correctly formed! Full response:")
             logger.info(informal_response)
         else:
@@ -1013,6 +1013,9 @@ class HILBERTWorker:
                 
             return success, proof
             
+        except BaseException:
+            success = False
+            raise
         finally:
             # Finalize statistics
             self._finalize_statistics(success if 'success' in locals() else False, problem_id)
@@ -1408,6 +1411,7 @@ class HILBERTWorker:
             
             # Process results and populate correct_proofs
             for job_name, result in all_results:
+                raise_if_fatal(result)
                 theorem_idx = theorem_jobs[job_name]
                 
                 if isinstance(result, Exception):
@@ -1953,6 +1957,7 @@ class HILBERTWorker:
         results = await pool.wait_for_all()
         corrected_theorems = []
         for job_name, theorem in results:
+            raise_if_fatal(theorem)
             if not theorem or isinstance(theorem, Exception):
                 logger.info("RETURNING NONE BECAUSE OF JOB_NAME: %s", job_name)
                 return None
@@ -2045,6 +2050,7 @@ class HILBERTWorker:
         extracted_theorems = []
 
         for _, result in all_results:
+            raise_if_fatal(result)
             if isinstance(result, BaseException):
                 return False, corrected_theorems, str(result), proved_theorems
             success, theorem, proof, justification = result

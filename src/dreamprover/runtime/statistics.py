@@ -129,6 +129,10 @@ class VerificationMetrics:
     batch_size: int = 1  # size of batch (1 for single verification)
     context: str = ""  # Additional context (e.g., theorem name, function context)
     timestamp: float = field(default_factory=time.time)
+    outcome: str = "unknown"  # Historical records cannot distinguish failure classes.
+    diagnostic: str = ""  # Full bounded verifier diagnostic, including retry failures.
+    retry_count: int = 0
+    outcomes: List[Dict[str, Any]] = field(default_factory=list)  # Per-snippet batch outcomes.
 
 @dataclass
 class LLMCallMetrics:
@@ -215,6 +219,7 @@ class ProofStatistics:
     verification_success_rates: Dict[str, float] = field(default_factory=dict)
     verification_validity_rates: Dict[str, float] = field(default_factory=dict)
     total_verification_duration: Dict[str, float] = field(default_factory=dict)
+    verification_outcome_counts: Dict[str, int] = field(default_factory=dict)
     
     def __post_init__(self):
         """Initialize computed fields."""
@@ -256,7 +261,9 @@ class ProofStatistics:
                                  return_error_message: bool = False, success: bool = True,
                                  proof_valid: bool = False, has_error_message: bool = False,
                                  proof_length: int = 0, is_batch: bool = False,
-                                 batch_size: int = 1, context: str = ""):
+                                 batch_size: int = 1, context: str = "",
+                                 outcome: str = "unknown", diagnostic: str = "",
+                                 retry_count: int = 0, outcomes: Optional[List[Dict[str, Any]]] = None):
         """Add a verification operation to the statistics."""
         verification_metrics = VerificationMetrics(
             verification_type=verification_type.value,
@@ -270,7 +277,11 @@ class ProofStatistics:
             proof_length=proof_length,
             is_batch=is_batch,
             batch_size=batch_size,
-            context=context
+            context=context,
+            outcome=outcome,
+            diagnostic=diagnostic,
+            retry_count=retry_count,
+            outcomes=list(outcomes or []),
         )
         self.verification_operations.append(verification_metrics)
         self._update_verification_aggregates(verification_metrics)
@@ -341,6 +352,10 @@ class ProofStatistics:
             self.total_verification_operations.get(verification_type, 0) + 1
         self.total_verification_duration[verification_type] = \
             self.total_verification_duration.get(verification_type, 0.0) + verification_metrics.verification_duration
+        outcomes = verification_metrics.outcomes or [{"outcome": verification_metrics.outcome}]
+        for outcome in outcomes:
+            kind = outcome.get("outcome", "unknown")
+            self.verification_outcome_counts[kind] = self.verification_outcome_counts.get(kind, 0) + 1
     
     def _compute_prompt_type_success_rates(self):
         """Compute success rates for each prompt type."""
@@ -409,6 +424,7 @@ class ProofStatistics:
         self.total_search_operations.clear()
         self.total_verification_operations.clear()
         self.total_verification_duration.clear()
+        self.verification_outcome_counts.clear()
         self.prompt_type_counts.clear()
         self.strategy_counts.clear()
         
@@ -458,6 +474,7 @@ class ProofStatistics:
             "token_breakdown": dict(self.total_tokens),
             "search_operation_breakdown": dict(self.total_search_operations),
             "verification_operation_breakdown": dict(self.total_verification_operations),
+            "verification_outcome_counts": dict(self.verification_outcome_counts),
             "verification_duration_breakdown": dict(self.total_verification_duration),
             "prompt_type_breakdown": dict(self.prompt_type_counts),
             "strategy_attempts": dict(self.strategy_counts),

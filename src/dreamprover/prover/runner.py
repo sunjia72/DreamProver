@@ -10,6 +10,7 @@ from dreamprover.prover.worker import HILBERTWorker
 from dreamprover.lean.library import LemmaLibrary
 from dreamprover.lean.text import extract_jsonl_contents
 from dreamprover.prover.config import ProofAttemptConfig
+from dreamprover.runtime.jobs import raise_if_fatal
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,7 @@ class AsyncHILBERT:
                     )
                     return bool(success), proof, None
                 except Exception as exc:
+                    raise_if_fatal(exc)
                     logger.exception("Problem %s failed", problem_id)
                     return False, None, f"{type(exc).__name__}: {exc}"
                 finally:

@@ -2,229 +2,206 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2025 Apple Inc. All Rights Reserved.
 #
-import traceback
+"""Lean verification with separate mathematical, resource, and infrastructure outcomes."""
 import asyncio
+import logging
+from contextvars import ContextVar
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import List, Tuple, Optional
-from dreamprover.lean.kimina import DiagnosticAsyncKiminaClient as AsyncKiminaClient
+
+from dreamprover.lean.kimina import DiagnosticAsyncKiminaClient as AsyncKiminaClient, verifier_failure_message
 from kimina_client.models import Snippet
 from dreamprover.lean.proof import (
-    read_client_response, can_reuse_lean_environment, response_has_server_failure, order_client_response,
-    prepare_lean_verification, proof_axiom_audit_error,
+    VerificationInfrastructureError, VerificationOutcome, bounded_verification_diagnostic,
+    can_reuse_lean_environment, classify_client_result, is_verification_resource_failure,
+    order_client_response, prepare_lean_verification, proof_axiom_audit_error,
 )
 from dreamprover.lean.helpers import extract_all_error_messages
-from dreamprover.lean.library import assert_complete_source
-import logging
+
 logger = logging.getLogger(__name__)
 
-class AsyncLeanVerifier:
-    """
-    Lean verification optimized for throughput with async/await patterns
-    and leverages AsyncKiminaClient's built-in concurrency management.
-    """
 
-    def __init__(self, 
-                 base_url: str,
-                 max_concurrent_requests: int = 10,
-                 default_batch_size: int = 8,
-                 http_timeout: int = 600):
-        """
-        Initialize AsyncLeanVerifier with async client.
-        
-        Args:
-            base_url: The base URL for the Lean server API
-            max_concurrent_requests: Maximum number of concurrent operations (default: 10)
-            default_batch_size: Default batch size for operations (default: 8)
-            http_timeout: HTTP timeout in seconds (default: 600)
-        """
+class AsyncLeanVerifier:
+    """A failed server check never becomes a completed, unsuccessful proof."""
+
+    def __init__(self, base_url: str, max_concurrent_requests: int = 10,
+                 default_batch_size: int = 8, http_timeout: int = 600):
         if max_concurrent_requests < 1 or default_batch_size < 1:
             raise ValueError("Verifier concurrency and batch size must be positive")
-        self.client = AsyncKiminaClient(
-            api_url=base_url,
-            http_timeout=http_timeout,
-            n_retries=1
-        )
+        self.client = AsyncKiminaClient(api_url=base_url, http_timeout=http_timeout, n_retries=1)
         self.max_concurrent = max_concurrent_requests
         self._semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.default_batch_size = default_batch_size
         self._closed = False
+        # Multiple workers share a verifier. The awaiting caller must see its own
+        # verdict, not whichever concurrent request finished most recently.
+        self._outcomes = ContextVar(f"lean_verifier_outcomes_{id(self)}", default=())
+
+    @property
+    def last_outcomes(self):
+        return self._outcomes.get()
+
+    @property
+    def last_outcome(self):
+        outcomes = self.last_outcomes
+        return outcomes[0] if len(outcomes) == 1 else None
+
+    def get_last_verification_outcomes(self):
+        return self.last_outcomes
 
     async def __aenter__(self):
-        """Async context manager entry."""
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit with proper cleanup."""
         await self.close()
 
-    async def verify_proof(self, proof: str, timeout: int = 30,
-                          return_error_message: bool = False, 
-                          is_sorry_ok: bool = False, **metadata) -> bool | Tuple[bool, Optional[str]]:
-        """
-        Verify a single proof asynchronously.
-        
-        Args:
-            proof: The proof to verify
-            timeout: The timeout for the verification request (default: 30s)
-            return_error_message: Whether to return the error message if the proof is invalid (default: False)
-            is_sorry_ok: Whether to allow the proof to be valid even if it contains a "sorry" term (default: False)
-            
-        Returns:
-            bool: True if the proof is valid, False otherwise
-            Tuple[bool, Optional[str]]: If return_error_message=True, returns (is_valid, error_message)
-        """
-        if self._closed:
-            raise RuntimeError("AsyncLeanVerifier is closed")
-            
-        proof = proof.strip()
-        if not proof:
-            return (False, "Empty Lean source") if return_error_message else False
-        audited, audited_names, preparation_error = prepare_lean_verification(proof, is_sorry_ok)
-        if preparation_error:
-            return (False, preparation_error) if return_error_message else False
-        
-        # AsyncKiminaClient handles concurrency internally
-        async with self._semaphore:
-            response = await self.client.check(
-                audited, timeout=timeout, show_progress=False,
-                batch_size=self.max_concurrent, max_workers=self.max_concurrent,
-                reuse=can_reuse_lean_environment(proof),
-            )
-            if response_has_server_failure(response):
-                logger.warning("Verifier server failed; retrying once in a fresh Lean environment")
+    @staticmethod
+    def _classify(result, names, is_sorry_ok):
+        outcome = classify_client_result(result)
+        if is_sorry_ok and outcome.diagnostic == "Lean declaration uses 'sorry'":
+            return VerificationOutcome("valid", proof_valid=True)
+        if outcome.proof_valid and not is_sorry_ok:
+            audit_error = proof_axiom_audit_error(result, names)
+            if audit_error:
+                kind = "infrastructure_failure" if audit_error.startswith("Missing Lean axiom audits for:") else "mathematical_invalid"
+                return VerificationOutcome(kind, bounded_verification_diagnostic(audit_error))
+        return outcome
+
+    async def _check(self, snippets, names, timeout, is_sorry_ok, batch_size, show_progress, reuse):
+        """Return one explicit outcome per snippet, including SDK-safe failures."""
+        try:
+            async with self._semaphore:
                 response = await self.client.check(
-                    audited, timeout=timeout, show_progress=False, reuse=False,
-                    batch_size=self.max_concurrent, max_workers=self.max_concurrent,
+                    snippets, timeout=timeout, show_progress=show_progress,
+                    batch_size=batch_size, max_workers=self.max_concurrent, reuse=reuse,
                 )
-        
-        parsed = read_client_response(response)
-        if len(parsed) != 1:
-            raise RuntimeError(f"Verifier returned {len(parsed)} results for one proof")
-        verification_results = parsed[0]
+            response = order_client_response(response, [snippet.id for snippet in snippets])
+            results = response.results
+            return results, [self._classify(result, audit_names, is_sorry_ok)
+                             for result, audit_names in zip(results, names)]
+        except Exception as error:
+            raw_diagnostic = verifier_failure_message(error)
+            kind = "resource_exhausted" if is_verification_resource_failure(raw_diagnostic) else "infrastructure_failure"
+            diagnostic = bounded_verification_diagnostic(raw_diagnostic)
+            return [None] * len(snippets), [VerificationOutcome(kind, diagnostic)] * len(snippets)
 
-        if is_sorry_ok:
-            is_proof_valid = verification_results['is_correct_with_sorry']
-        else:
-            is_proof_valid = verification_results['is_correct_no_sorry']
-        audit_error = None if is_sorry_ok else proof_axiom_audit_error(response.results[0], audited_names)
-        if is_proof_valid and audit_error:
-            return (False, audit_error) if return_error_message else False
+    async def _checked_outcomes(self, snippets, names, timeout, is_sorry_ok,
+                                batch_size, show_progress, reuse):
+        results, outcomes = await self._check(
+            snippets, names, timeout, is_sorry_ok, batch_size, show_progress, reuse,
+        )
+        retry_indices = [i for i, outcome in enumerate(outcomes) if outcome.outcome == "infrastructure_failure"]
+        if retry_indices:
+            logger.warning("Verifier infrastructure failed for %d proof(s), retrying once in fresh Lean environments", len(retry_indices))
+            retried_results, retried_outcomes = await self._check(
+                [snippets[i] for i in retry_indices], [names[i] for i in retry_indices],
+                timeout, is_sorry_ok, batch_size, show_progress, False,
+            )
+            for i, result, outcome in zip(retry_indices, retried_results, retried_outcomes):
+                diagnostic = bounded_verification_diagnostic(
+                    f"Initial verification infrastructure failure:\n{outcomes[i].diagnostic}\n"
+                    f"Fresh-environment retry ({outcome.outcome}):\n{outcome.diagnostic}"
+                )
+                results[i] = result
+                outcomes[i] = replace(outcome, diagnostic=diagnostic, retry_count=1)
+        return results, outcomes
 
-        if return_error_message:
-            if not is_proof_valid:
-                try:
-                    error_messages = extract_all_error_messages(response, [proof])
-                except Exception:
-                    logger.info("Proof is invalid...")
-                    traceback.print_exc()
-                    return False, f"Proof:\n{proof}\n\nError: Most likely timed out"
-                return is_proof_valid, error_messages[0]
-            else:
-                return is_proof_valid, None
-        else:
-            return is_proof_valid
+    def _publish_outcomes(self, outcomes):
+        self._outcomes.set(tuple(outcomes))
+        failures = [outcome for outcome in outcomes if outcome.outcome == "infrastructure_failure"]
+        if failures:
+            raise VerificationInfrastructureError(
+                "\n".join(outcome.diagnostic for outcome in failures), outcomes,
+            )
 
-    async def batch_verify_proofs(self, proofs: List[str], 
-                                 return_error_messages: bool = False, 
-                                 timeout: int = 30, 
-                                 is_sorry_ok: bool = False,
-                                 batch_size: Optional[int] = None,
-                                 show_progress: bool = True) -> List[bool] | Tuple[List[bool], List[str]]:
-        """
-        Verify a batch of proofs asynchronously with optimized concurrency.
-        
-        Args:
-            proofs: A list of proofs to verify
-            return_error_messages: Whether to return the error messages if the proofs are invalid (default: False)
-            timeout: The timeout for the verification request (default: 30s)
-            is_sorry_ok: Whether to allow proofs that contain a "sorry" expression (default: False)
-            batch_size: Override the batch size for this operation
-            show_progress: Whether to show progress bar (default: True)
-            
-        Returns:
-            List[bool]: A list of booleans indicating the validity of each proof
-            Tuple[List[bool], List[str]]: If return_error_messages=True, returns (validity_list, error_messages_list)
+    @staticmethod
+    def _error_message(proof, result, outcome):
+        if outcome.proof_valid:
+            return None
+        # Preserve the existing line-context feedback used in correction prompts.
+        # Metadata additionally stores complete bounded server diagnostics.
+        if result is not None and outcome.outcome == "mathematical_invalid":
+            try:
+                message = extract_all_error_messages(SimpleNamespace(results=[result]), [proof])[0]
+                if outcome.diagnostic and ("axiom" in outcome.diagnostic.lower() or "sorry" in outcome.diagnostic.lower()):
+                    return f"{message}\nError: {outcome.diagnostic}"
+                return message
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+        return f"Proof: {proof}\nError: {outcome.diagnostic}"
+
+    async def verify_proof(self, proof: str, timeout: int = 30,
+                           return_error_message: bool = False,
+                           is_sorry_ok: bool = False, **metadata) -> bool | Tuple[bool, Optional[str]]:
+        """Return a proof verdict, or raise if the verifier did not finish reliably.
+
+        Resource exhaustion consumes the configured allowance and returns False.
+        Infrastructure failures get at most one fresh retry before they propagate.
         """
         if self._closed:
             raise RuntimeError("AsyncLeanVerifier is closed")
-            
+        self._outcomes.set(())
+        proof = proof.strip()
+        source, names, preparation_error = prepare_lean_verification(proof, is_sorry_ok)
+        if preparation_error:
+            outcome = VerificationOutcome("mathematical_invalid", bounded_verification_diagnostic(preparation_error))
+            self._publish_outcomes([outcome])
+            return (False, preparation_error) if return_error_message else False
+        snippet = Snippet.from_code(source)
+        results, outcomes = await self._checked_outcomes(
+            [snippet], [names], timeout, is_sorry_ok,
+            self.max_concurrent, False, can_reuse_lean_environment(proof),
+        )
+        self._publish_outcomes(outcomes)
+        outcome = outcomes[0]
+        if return_error_message:
+            return outcome.proof_valid, self._error_message(proof, results[0], outcome)
+        return outcome.proof_valid
+
+    async def batch_verify_proofs(self, proofs: List[str], return_error_messages: bool = False,
+                                  timeout: int = 30, is_sorry_ok: bool = False,
+                                  batch_size: Optional[int] = None,
+                                  show_progress: bool = True) -> List[bool] | Tuple[List[bool], List[str]]:
+        """Verify a batch with ordered outcomes and retry only interrupted snippets."""
+        if self._closed:
+            raise RuntimeError("AsyncLeanVerifier is closed")
+        self._outcomes.set(())
         if not proofs:
             return ([], []) if return_error_messages else []
-            
-        # Use provided parameters or fall back to instance defaults
         batch_sz = batch_size or self.default_batch_size
-        
-        # Create verification list with custom IDs
-
-        # Use AsyncKiminaClient's check method which handles concurrency internally
+        if batch_sz < 1:
+            raise ValueError("Verifier batch size must be positive")
         prepared = [prepare_lean_verification(proof, is_sorry_ok) for proof in proofs]
-        snippets = [Snippet.from_code(source) for source, _, _ in prepared]
-        responses = await self.client.check(
-            snippets,
-            timeout=timeout,
-            batch_size=batch_sz,
-            max_workers=self.max_concurrent,
-            show_progress=show_progress,
-            reuse=all(can_reuse_lean_environment(proof) for proof in proofs),
-        )
-        responses = order_client_response(responses, [snippet.id for snippet in snippets])
-        
-        # Parse results
-        parse_results = read_client_response(responses)
-        if len(parse_results) != len(proofs):
-            raise RuntimeError("Verifier response count does not match submitted proof count")
-
-        if is_sorry_ok:
-            verification_results = [
-                item['is_correct_with_sorry']
-                for item in parse_results
-            ]
-        else:
-            verification_results = [
-                item['is_correct_no_sorry']
-                for item in parse_results
-            ]
-            for i, proof in enumerate(proofs):
-                try:
-                    if not proof.strip():
-                        raise ValueError("Empty Lean source")
-                    assert_complete_source(proof)
-                except ValueError:
-                    verification_results[i] = False
-                if prepared[i][2] or proof_axiom_audit_error(responses.results[i], prepared[i][1]):
-                    verification_results[i] = False
-
+        outcomes = [VerificationOutcome("mathematical_invalid", bounded_verification_diagnostic(error or ""))
+                    for _, _, error in prepared]
+        results = [None] * len(proofs)
+        submitted_indices = [i for i, (_, _, error) in enumerate(prepared) if error is None]
+        if submitted_indices:
+            snippets = [Snippet.from_code(prepared[i][0]) for i in submitted_indices]
+            checked_results, checked_outcomes = await self._checked_outcomes(
+                snippets, [prepared[i][1] for i in submitted_indices], timeout, is_sorry_ok,
+                batch_sz, show_progress,
+                all(can_reuse_lean_environment(proofs[i]) for i in submitted_indices),
+            )
+            for i, result, outcome in zip(submitted_indices, checked_results, checked_outcomes):
+                results[i], outcomes[i] = result, outcome
+        self._publish_outcomes(outcomes)
+        validity = [outcome.proof_valid for outcome in outcomes]
         if return_error_messages:
-            all_error_messages = extract_all_error_messages(responses, proofs)
-            if not is_sorry_ok:
-                for i, (_, names, error) in enumerate(prepared):
-                    audit_error = error or proof_axiom_audit_error(responses.results[i], names)
-                    if audit_error and not all_error_messages[i]:
-                        all_error_messages[i] = audit_error
-            return verification_results, all_error_messages
-        else:
-            return verification_results
+            return validity, [self._error_message(proof, result, outcome) or ""
+                              for proof, result, outcome in zip(proofs, results, outcomes)]
+        return validity
 
     async def close(self):
-        """
-        Explicitly close the AsyncLeanVerifier and clean up resources.
-        
-        This should be called when you're done using the verifier, or use it as an async context manager.
-        """
         if not self._closed:
             await self.client.close()
             self._closed = True
 
     def __del__(self):
-        """
-        Destructor to ensure resources are cleaned up if close() wasn't called explicitly.
-        
-        Note: This will log a warning if close() wasn't called properly.
-        """
         if hasattr(self, '_closed') and not self._closed:
             import warnings
             warnings.warn(
                 "AsyncLeanVerifier was not properly closed. Use 'async with AsyncLeanVerifier(...)' "
-                "or call 'await verifier.close()' explicitly.",
-                ResourceWarning,
-                stacklevel=2
+                "or call 'await verifier.close()' explicitly.", ResourceWarning, stacklevel=2,
             )

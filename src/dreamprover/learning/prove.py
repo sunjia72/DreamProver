@@ -44,7 +44,10 @@ def prove_candidates(candidates: list[dict], complete, *, header: str, library: 
             raise ValueError("Candidates and library must use the same preamble")
         checked = check_lean_source(source, project_root=project_root, timeout=timeout)
         if not checked["proved"]:
-            raise ValueError("Existing library did not verify without sorry")
+            raise ValueError(
+                f"Existing library verification failed ({checked.get('outcome', 'mathematical_invalid')}):\n"
+                + checked.get("diagnostic", checked["stdout"] + checked["stderr"])
+            )
     reports = []
     for candidate in candidates:
         name = candidate["name"]
@@ -55,6 +58,9 @@ def prove_candidates(candidates: list[dict], complete, *, header: str, library: 
         last_error = ""
         solved = False
         calls = 0
+        verification_outcomes = []
+        last_outcome = "mathematical_invalid"
+        last_resource_kind = None
         for attempt in range(attempts):
             feedback = ""
             for correction in range(corrections + 1):
@@ -63,6 +69,8 @@ def prove_candidates(candidates: list[dict], complete, *, header: str, library: 
                 response = complete(prompt)
                 calls += 1
                 blocks = re.findall(r"```(?:lean4?|Lean4?)\s*\n(.*?)```", response, re.DOTALL)
+                last_outcome = "mathematical_invalid"
+                last_resource_kind = None
                 try:
                     if len(blocks) != 1:
                         raise ValueError("Expected one Lean proof block")
@@ -74,7 +82,20 @@ def prove_candidates(candidates: list[dict], complete, *, header: str, library: 
                         raise ValueError("Model changed the original candidate statement")
                     supporting_source = library_lean_source(accepted) if accepted else header
                     result = check_lean_source(supporting_source + "\n\n" + declaration.source, project_root=project_root, timeout=timeout)
+                    last_outcome = result.get("outcome", "valid" if result["proved"] else "mathematical_invalid")
+                    last_resource_kind = result.get("resource_kind")
+                    verification_outcomes.append({
+                        "attempt": attempt + 1, "correction": correction,
+                        "outcome": last_outcome, "resource_kind": last_resource_kind,
+                        "diagnostic": result.get("diagnostic", ""), "timeout_seconds": timeout,
+                    })
                     if not result["proved"]:
+                        if last_outcome == "resource_exhausted":
+                            raise ValueError(
+                                f"Lean verification resource allowance exhausted ({last_resource_kind or 'resource'}). "
+                                f"The timeout remains {timeout} seconds. Use a proof that fits the same allowance.\n"
+                                + result.get("diagnostic", result["stdout"] + result["stderr"])
+                            )
                         raise ValueError("Lean did not verify this as a proof without sorry/axioms:\n" + result["stdout"] + result["stderr"])
                 except ValueError as exc:
                     last_error = str(exc)
@@ -95,7 +116,13 @@ def prove_candidates(candidates: list[dict], complete, *, header: str, library: 
                 break
             if solved:
                 break
-        reports.append({"name": name, "proved": solved, "model_calls": calls, "last_error": "" if solved else last_error})
+        reports.append({
+            "name": name, "proved": solved, "model_calls": calls,
+            "last_error": "" if solved else last_error,
+            "outcome": "valid" if solved else last_outcome,
+            "resource_kind": None if solved else last_resource_kind,
+            "verification_outcomes": verification_outcomes,
+        })
     proofs = {name: record for name, record in accepted.items() if not library or name not in library}
     return proofs, reports
 

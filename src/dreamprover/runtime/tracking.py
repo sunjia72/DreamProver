@@ -9,6 +9,7 @@ These wrappers intercept LLM calls to track token usage and performance metrics.
 """
 
 import time
+from dreamprover.lean.proof import bounded_verification_diagnostic
 from typing import Dict, List, Optional
 from dreamprover.runtime.statistics import ProofStatistics, LLMType, StrategyType, PromptType, VerificationType
 import logging
@@ -460,8 +461,35 @@ class TrackedAsyncLeanVerifier:
     def _track_verification(self, verification_type: VerificationType, verification_duration: float,
                            timeout: int, is_sorry_ok: bool, return_error_message: bool,
                            success: bool, proof_valid: bool, has_error_message: bool,
-                           proof_length: int, is_batch: bool, batch_size: int, context: str):
-        """Helper method to track verification operations."""
+                           proof_length: int, is_batch: bool, batch_size: int, context: str,
+                           exception: Optional[Exception] = None):
+        """Keep classified, bounded diagnostics instead of only an error flag."""
+        if exception is not None:
+            raw_outcomes = getattr(exception, "outcomes", ())
+        else:
+            getter = getattr(self.lean_verifier, "get_last_verification_outcomes", None)
+            raw_outcomes = getter() if callable(getter) else ()
+        outcomes = [item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                    for item in raw_outcomes]
+        if outcomes:
+            kinds = {item["outcome"] for item in outcomes}
+            if "infrastructure_failure" in kinds:
+                outcome = "infrastructure_failure"
+            elif "resource_exhausted" in kinds:
+                outcome = "resource_exhausted"
+            else:
+                outcome = next(iter(kinds)) if len(kinds) == 1 else "mixed"
+            diagnostic = bounded_verification_diagnostic("\n".join(
+                f"Snippet {i + 1} ({item['outcome']}): {item['diagnostic']}"
+                for i, item in enumerate(outcomes) if item.get("diagnostic")
+            ))
+            retry_count = max((item.get("retry_count", 0) for item in outcomes), default=0)
+            success = not bool(kinds & {"resource_exhausted", "infrastructure_failure"})
+        else:
+            outcome = "infrastructure_failure" if exception is not None else ("valid" if proof_valid else "mathematical_invalid")
+            diagnostic = bounded_verification_diagnostic(exception) if exception is not None else ""
+            retry_count = 0
+        has_error_message = has_error_message or bool(diagnostic)
         self.stats.add_verification_operation(
             verification_type=verification_type,
             verification_duration=verification_duration,
@@ -474,7 +502,11 @@ class TrackedAsyncLeanVerifier:
             proof_length=proof_length,
             is_batch=is_batch,
             batch_size=batch_size,
-            context=context
+            context=context,
+            outcome=outcome,
+            diagnostic=diagnostic,
+            retry_count=retry_count,
+            outcomes=outcomes,
         )
     
     async def verify_proof(self, proof: str, timeout: int = 30, 
@@ -514,9 +546,9 @@ class TrackedAsyncLeanVerifier:
             self._track_verification(
                 verification_type, verification_duration, timeout, is_sorry_ok,
                 return_error_message, False, False, False,
-                proof_length, False, 1, context
+                proof_length, False, 1, context, exception=e
             )
-            raise e
+            raise
     
     async def batch_verify_proofs(self, proofs: List[str], 
                                  return_error_messages: bool = False, 
@@ -561,9 +593,9 @@ class TrackedAsyncLeanVerifier:
             self._track_verification(
                 verification_type, verification_duration, timeout, is_sorry_ok,
                 return_error_messages, False, False, False,
-                total_proof_length, True, actual_batch_size, context
+                total_proof_length, True, actual_batch_size, context, exception=e
             )
-            raise e
+            raise
     
     def __getattr__(self, name):
         """Delegate other methods to the wrapped verifier."""

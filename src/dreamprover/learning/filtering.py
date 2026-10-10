@@ -78,9 +78,17 @@ def filter_candidates(proposals: dict, source_library: dict, comparator: Structu
 
 
 def deduplicate_candidates(proposals: dict, existing_library: dict, comparator: StructuralComparator, *, duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD) -> dict:
-    """Remove high-tree-similarity proposals before spending proof attempts."""
+    """Remove proposals similar to existing verified lemmas.
+
+    Unproved proposals cannot suppress one another: a structurally similar
+    earlier proposal may be false or too difficult to prove. Newly proved
+    candidates are deduplicated when they are admitted to the library.
+    """
     _threshold(duplicate_threshold, "duplicate_threshold")
     result = copy.deepcopy(proposals)
+    for name, record in existing_library.items():
+        if record.get("verification_status") != "verified":
+            raise ValueError(f"Existing library lemma {name!r} is not verified")
     comparator.preload([(record["statement"], record.get("header", "")) for record in existing_library.values()] +
                        [(candidate["statement"], candidate.get("header", "")) for candidate in proposals.get("candidates", [])])
     references = []
@@ -103,11 +111,10 @@ def deduplicate_candidates(proposals: dict, existing_library: dict, comparator: 
             duplicates.append(dict(candidate, duplicate_of=duplicate[0], duplicate_similarity=duplicate[1], duplicate_reference=duplicate[2]))
         else:
             kept.append(candidate)
-            references.append((candidate["name"], parsed, "earlier_candidate"))
     result["candidates"] = kept
     result["duplicate_candidates"] = duplicates
     result["rejected_candidates"] = errors
-    result["structural_deduplication"] = dict(comparator.metadata(), duplicate_threshold=duplicate_threshold, comparison="normalized_tree_edit_similarity_greater_or_equal", retained_candidates=len(kept), duplicate_candidates=len(duplicates))
+    result["structural_deduplication"] = dict(comparator.metadata(), duplicate_threshold=duplicate_threshold, comparison="normalized_tree_edit_similarity_greater_or_equal", reference_policy="existing_verified_library_only", retained_candidates=len(kept), duplicate_candidates=len(duplicates))
     return result
 
 

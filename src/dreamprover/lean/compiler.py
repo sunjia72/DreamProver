@@ -49,16 +49,37 @@ def _project_root(project_root: str | Path | None = None) -> Path:
     return root
 
 
+def _infrastructure_failure(diagnostic: str):
+    # Import locally: proof-verification helpers also use compiler axiom audits.
+    from dreamprover.lean.proof import VerificationInfrastructureError, VerificationOutcome
+
+    raise VerificationInfrastructureError(
+        diagnostic, (VerificationOutcome("infrastructure_failure", diagnostic),)
+    )
+
+
+def _resource_kind(diagnostic: str) -> str:
+    if re.search(r"std::bad_alloc|out of memory|memory allocation failed", diagnostic, re.IGNORECASE):
+        return "memory"
+    if "heartbeat" in diagnostic.lower():
+        return "heartbeats"
+    if "recursion depth" in diagnostic.lower():
+        return "recursion"
+    if "timed out" in diagnostic.lower() or "timeout" in diagnostic.lower():
+        return "time"
+    return "resource"
+
+
 def compile_lean_file(
     lean_file_path: str | Path,
     *,
     project_root: str | Path | None = None,
     timeout: float = 120,
 ) -> dict[str, Any]:
-    """Compile source and preserve the process exit status for validation."""
+    """Compile source with distinct proof, resource, and infrastructure verdicts."""
     path = Path(lean_file_path).resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"Lean file not found: {path}")
+        _infrastructure_failure(f"Lean file not found: {path}")
     try:
         result = subprocess.run(
             ["lake", "env", "lean", str(path)],
@@ -69,21 +90,54 @@ def compile_lean_file(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        from dreamprover.lean.proof import bounded_verification_diagnostic
+
         def output_text(value):
             return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+        diagnostic = bounded_verification_diagnostic(
+            output_text(exc.stdout) + output_text(exc.stderr) + f"\nLean compiler timed out after {timeout} seconds"
+        )
         return {
             "returncode": 124,
             "stdout": output_text(exc.stdout),
             "stderr": output_text(exc.stderr) + f"\nerror: Lean compiler timed out after {timeout} seconds\n",
             "has_errors": True,
             "timed_out": True,
+            "outcome": "resource_exhausted",
+            "diagnostic": diagnostic,
+            "resource_kind": "time",
         }
+    except OSError as exc:
+        _infrastructure_failure(f"Cannot execute Lean compiler: {exc}")
+    from dreamprover.lean.proof import bounded_verification_diagnostic, is_verification_resource_failure
+
+    diagnostic = bounded_verification_diagnostic(result.stdout + result.stderr)
+    outcome = "valid"
+    resource_kind = None
+    if result.returncode != 0:
+        if is_verification_resource_failure(diagnostic):
+            outcome = "resource_exhausted"
+            resource_kind = _resource_kind(diagnostic)
+        elif (result.returncode < 0 or result.returncode >= 128 or re.search(
+                r"segmentation fault|illegal instruction|bus error|core dumped|"
+                r"(?:toolchain[^\n]*(?:not installed|not found|unavailable))|"
+                r"no default toolchain|failed to (?:download|execute)|"
+                r"could not execute|error while loading shared libraries",
+                diagnostic, re.IGNORECASE)):
+            _infrastructure_failure(f"Lean compiler unavailable or crashed (exit {result.returncode}):\n{diagnostic}")
+        elif not diagnostic.strip():
+            _infrastructure_failure(f"Lean compiler exited with status {result.returncode} without diagnostics")
+        else:
+            outcome = "mathematical_invalid"
     return {
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
         "has_errors": result.returncode != 0,
         "timed_out": False,
+        "outcome": outcome,
+        "diagnostic": diagnostic,
+        "resource_kind": resource_kind,
     }
 
 
@@ -101,11 +155,14 @@ def run_lean_file(lean_file_path: str | Path, *, project_root=None, timeout: flo
 
 
 def _with_source(lean_source: str, runner, *, project_root=None, timeout=120):
-    root = _project_root(project_root)
-    with tempfile.TemporaryDirectory(prefix="dreamprover-", dir=root) as directory:
-        path = Path(directory) / "source.lean"
-        path.write_text(lean_source, encoding="utf-8")
-        return runner(path, project_root=root, timeout=timeout)
+    try:
+        root = _project_root(project_root)
+        with tempfile.TemporaryDirectory(prefix="dreamprover-", dir=root) as directory:
+            path = Path(directory) / "source.lean"
+            path.write_text(lean_source, encoding="utf-8")
+            return runner(path, project_root=root, timeout=timeout)
+    except OSError as exc:
+        _infrastructure_failure(f"Cannot prepare Lean compiler input: {exc}")
 
 
 def append_axiom_audits(lean_source: str) -> tuple[str, list[str]]:
@@ -133,7 +190,9 @@ def append_axiom_audits(lean_source: str) -> tuple[str, list[str]]:
 def axioms_from_diagnostics(diagnostics: str) -> dict[str, list[str]]:
     """Read standard Lean `#print axioms` information messages."""
     result = {}
-    for match in re.finditer(r"'(.+?)' depends on axioms:\s*\[([^]]*)\]", diagnostics, re.DOTALL):
+    # Lean warnings can contain quoted words before an audit on a later line.
+    # Only dependency lists may span lines, never the displayed theorem name.
+    for match in re.finditer(r"'([^\r\n]+?)' depends on axioms:\s*\[([^]]*)\]", diagnostics, re.DOTALL):
         result[match.group(1)] = [name.strip() for name in match.group(2).split(",") if name.strip()]
     for match in re.finditer(r"'([^\n]+)' does not depend on any axioms", diagnostics):
         result[match.group(1)] = []
@@ -173,6 +232,13 @@ def check_lean_source(lean_source: str, *, project_root=None, timeout: float = 1
     result["proved"] = (not result["has_errors"] and not result["has_sorry"]
                         and not result["has_untrusted_declarations"] and result["axiom_audit_complete"]
                         and not result["untrusted_axiom_dependencies"])
+    if not result["has_errors"] and not result["has_sorry"] and not result["axiom_audit_complete"]:
+        _infrastructure_failure("Lean compilation returned no required axiom audit for: " + ", ".join(audited_names))
+    if not result["proved"] and result["outcome"] == "valid":
+        result["outcome"] = "mathematical_invalid"
+        result["diagnostic"] = result["axiom_audit_error"] or (
+            "Lean proof uses sorry" if result["has_sorry"] else "Lean source introduces untrusted declarations"
+        )
     return result
 
 

@@ -50,6 +50,14 @@ above is an example. Tune it with `--max-cost-usd`. Spending is shared across
 both commands, which resume from checkpoints. Settings are in
 [inequalities.yaml](configs/pipeline/inequalities.yaml). Outputs stay in `runs/`.
 
+For a shorter run, finish one cycle and compare fresh retries on its unsolved
+training problems. This measures training gains, not held-out transfer.
+
+```bash
+dreamprover train --config configs/pipeline/inequalities.yaml --max-cost-usd 25 --stop-after-cycle 1
+dreamprover assess --config configs/pipeline/inequalities.yaml --max-cost-usd 25 --cycle 1
+```
+
 ```bash
 dreamprover monitor --run-dir runs/inequalities/gpt-6-luna
 dreamprover report --run-dir runs/inequalities/gpt-6-luna

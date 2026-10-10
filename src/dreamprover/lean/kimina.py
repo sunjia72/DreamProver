@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 
+from dreamprover.lean.proof import bounded_verification_diagnostic
+
 from kimina_client.async_client import AsyncKiminaClient
 from kimina_client.sync_client import KiminaClient
 
@@ -24,7 +26,7 @@ def verifier_failure_message(error: Exception) -> str:
             except ValueError:
                 body = response.text
             if body:
-                return f"{error}\nVerifier HTTP {response.status_code} diagnostic:\n{body[:16384]}"
+                return bounded_verification_diagnostic(f"{error}\nVerifier HTTP {response.status_code} diagnostic:\n{body}")
         pending.extend(value for value in (getattr(current, "__cause__", None),
                                            getattr(current, "__context__", None)) if value is not None)
         attempt = getattr(current, "last_attempt", None)
@@ -32,7 +34,7 @@ def verifier_failure_message(error: Exception) -> str:
             nested = attempt.exception()
             if nested is not None:
                 pending.append(nested)
-    return str(error)
+    return bounded_verification_diagnostic(error)
 
 
 class DiagnosticAsyncKiminaClient(AsyncKiminaClient):

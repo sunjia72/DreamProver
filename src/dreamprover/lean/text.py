@@ -226,3 +226,9 @@ def remove_think_block(text: str) -> str:
         return think_pattern.sub("", text).strip()
     else:
         return text
+
+
+def parse_affirmative_verdict(response: str) -> bool:
+    """Read the requested leading YES/NO verdict, excluding incidental mentions."""
+    verdict = re.match(r"\s*(?:\*\*)?(YES|NO)\b", response, re.IGNORECASE)
+    return bool(verdict and verdict.group(1).upper() == "YES")

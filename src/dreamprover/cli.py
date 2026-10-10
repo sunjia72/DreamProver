@@ -8,6 +8,7 @@ _COMMANDS = {
     "prove": ("dreamprover.prover.run", "Run recursive proving on a configured dataset"),
     "train": ("dreamprover.pipeline", "Learn a lemma library through wake/sleep cycles"),
     "evaluate": ("dreamprover.pipeline", "Evaluate empty and learned libraries on held-out problems"),
+    "assess": ("dreamprover.learning.assessment", "Compare library-assisted retries on unsolved training targets"),
     "monitor": ("dreamprover.runtime.monitor", "Inspect a running experiment without model calls"),
     "report": ("dreamprover.runtime.report", "Write a report from saved experiment checkpoints"),
     "doctor": ("dreamprover.doctor", "Check configuration, dependencies, and optional services"),

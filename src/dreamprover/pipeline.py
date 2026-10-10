@@ -29,10 +29,12 @@ from dreamprover.runtime.budget import BudgetExhausted, BudgetLedger, BudgetedCl
 from dreamprover.learning.extract import build_library, library_lean_source, write_library
 from dreamprover.lean.source import extract_declarations, mask_comments_and_strings, referenced_names, split_statement_proof
 from dreamprover.learning.update import _statement_key
+from dreamprover.learning.checkpoints import load_cycle_library
 from dreamprover.paths import config_directory, repository_root, working_directory
 from dreamprover.prover.worker import HILBERTWorker
 from dreamprover.runtime.io import safe_problem_filename
 from dreamprover.lean.library import LemmaLibrary
+from dreamprover.lean.proof import VerificationInfrastructureError
 from dreamprover.prover.config import ProofAttemptConfig
 from dreamprover.runtime.tracking import MaxLLMCallsExceeded
 
@@ -402,7 +404,8 @@ class Pipeline:
         atomic_json(self.root / "status.json", dict(phase=phase, status=status,
                     budget=self.ledger.summary(), **extra))
 
-    def run_problem(self, problem, library, directory: Path, *, training: bool):
+    def run_problem(self, problem, library, directory: Path, *, training: bool,
+                    proof_config=None, max_depth=None):
         checkpoint = directory / "result.json"
         if checkpoint.exists():
             return _read(checkpoint)
@@ -418,8 +421,8 @@ class Pipeline:
                 AsyncProverLLM(prover_client, self.config.model, max_tokens=self.config.max_completion_tokens),
                 reasoner_client,
                 AsyncLeanVerifier(self.config.verifier_url, max_concurrent_requests=2), None,
-                proof_attempt_config=self.config.proof_config(training),
-                max_depth=self.config.wake_depth if training else self.config.inference_depth,
+                proof_attempt_config=proof_config if proof_config is not None else self.config.proof_config(training),
+                max_depth=max_depth if max_depth is not None else (self.config.wake_depth if training else self.config.inference_depth),
                 enable_retrieval=False, enable_statistics=True,
                 lemma_library=LemmaLibrary(source, "\n".join(record["statement"] for record in library.values())),
                 max_tokens=self.config.max_completion_tokens, proof_save_dir=str(directory / "proofs"),
@@ -432,6 +435,14 @@ class Pipeline:
                 # Keep direct experiences and cached calls, but leave result.json
                 # absent so the interrupted problem resumes after a cap increase.
                 raise
+            except VerificationInfrastructureError as exc:
+                atomic_json(directory / "incomplete.json", dict(
+                    id=problem["id"], stop_reason="verification_infrastructure_failure",
+                    resumable=True, diagnostic=exc.diagnostic,
+                    verification_outcomes=[outcome.to_dict() for outcome in exc.outcomes],
+                    statistics=worker.stats.get_summary_stats(),
+                    api_usage=self.ledger.summary(scope + "/")))
+                raise
             except MaxLLMCallsExceeded as exc:
                 result = dict(id=problem["id"], success=False, proof=None,
                               stop_reason="per_problem_call_limit", error=str(exc),
@@ -443,10 +454,11 @@ class Pipeline:
             result["api_usage"] = self.ledger.summary(scope + "/")
             result["library_lemmas_used"] = referenced_names(result.get("proof") or "", set(library))
             atomic_json(checkpoint, result)
+            (directory / "incomplete.json").unlink(missing_ok=True)
             return result
         return asyncio.run(run())
 
-    def run_jobs(self, jobs: list[tuple], *, training: bool):
+    def run_jobs(self, jobs: list[tuple], *, training: bool, proof_config=None, max_depth=None):
         """Continuously fill a bounded set of active problems; checkpoint each.
 
         Admission order is deterministic. Completion and remote token use may
@@ -463,7 +475,8 @@ class Pipeline:
                     index, (problem, library, directory) = next(iterator)
                 except StopIteration:
                     return False
-                future = executor.submit(self.run_problem, problem, library, directory, training=training)
+                future = executor.submit(self.run_problem, problem, library, directory,
+                                         training=training, proof_config=proof_config, max_depth=max_depth)
                 pending[future] = index
                 return True
             for _ in range(concurrency):
@@ -480,6 +493,8 @@ class Pipeline:
                         if error is None:
                             error = exc
                 if error is not None:
+                    if isinstance(error, VerificationInfrastructureError):
+                        self.stop_event.set()
                     # No queued tail: already admitted jobs finish before the
                     # original error is raised. Their checkpoints remain usable.
                     for future in sorted(pending, key=pending.get):
@@ -494,33 +509,74 @@ class Pipeline:
 
     def collect_experiences(self, cycle: int, directory: Path, library: dict):
         checkpoint = directory / "experiences.json"
-        if checkpoint.exists():
-            return _read(checkpoint)
+        # Reconstruct the aggregate from individually validated exports on each
+        # resume. An aggregate alone cannot authenticate changed wake captures.
         records = {}
+        captures = []
         for problem in self.train:
             problem_dir = directory / "wake" / safe_problem_filename(problem["id"])
             files = sorted((problem_dir / "experiences").glob("*.lean"))
             for capture_index, path in enumerate(files):
-                source = path.read_text()
-                _, declarations = extract_declarations(source)
-                new = [declaration for declaration in declarations if declaration.name not in library]
-                prefix = f"wake_c{cycle}_{fingerprint(problem['id'])[:10]}_{capture_index}_"
-                names = {decl.name: prefix + str(index) for index, decl in enumerate(new)}
-                renamed = _replace_names(source, names)
-                export = directory / "extracted" / safe_problem_filename(problem["id"]) / str(capture_index)
-                export.mkdir(parents=True, exist_ok=True)
+                captures.append((problem, capture_index, path))
+        compiler_digest = _hash_if_present(Path(__file__).resolve().parent / "lean/compiler.py")
+
+        def extract_capture(capture):
+            problem, capture_index, path = capture
+            source = path.read_bytes().decode("utf-8")
+            if path.stem != fingerprint(source):
+                raise ValueError(f"Wake experience content does not match its digest: {path}")
+            _, declarations = extract_declarations(source)
+            new = [declaration for declaration in declarations if declaration.name not in library]
+            prefix = f"wake_c{cycle}_{fingerprint(problem['id'])[:10]}_{capture_index}_"
+            names = {decl.name: prefix + str(index) for index, decl in enumerate(new)}
+            renamed = _replace_names(source, names)
+            export = directory / "extracted" / safe_problem_filename(problem["id"]) / str(capture_index)
+            export.mkdir(parents=True, exist_ok=True)
+            identity = dict(source_sha256=fingerprint(renamed), compiler_sha256=compiler_digest,
+                            verification_timeout=self.config.verification_timeout,
+                            runtime_sha256=fingerprint(_read(self.root / "manifest.json")["identity"]["runtime"]))
+            try:
+                saved = _read(export / "verified.json")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                saved = None
+            if (isinstance(saved, dict) and isinstance(saved.get("records"), dict)
+                    and all(isinstance(value, dict) for value in saved["records"].values())
+                    and saved.get("identity") == identity
+                    and saved.get("records_sha256") == fingerprint(saved.get("records"))):
+                extracted = saved["records"]
+            else:
                 (export / "proof.lean").write_text(renamed)
-                # Verification uses the actual domain Lake project, independently
-                # of in-memory server flags and input verification_status fields.
+                # Each export still receives an independent native Lean check.
                 extracted = build_library(export, verify=True, project_root=self.config.lean_project,
                                           timeout=self.config.verification_timeout)
-                for name, record in extracted.items():
-                    if name in library:
-                        continue
-                    records[name] = dict(record, training_problem_id=problem["id"], cycle=cycle,
-                                         original_wake_source=str(path))
+                atomic_json(export / "verified.json", dict(identity=identity, records=extracted,
+                            records_sha256=fingerprint(extracted)))
+            return {name: dict(record, training_problem_id=problem["id"], cycle=cycle,
+                               original_wake_source=str(path))
+                    for name, record in extracted.items() if name not in library}
+
+        self._map_stage(captures, extract_capture, records.update)
         atomic_json(checkpoint, records)
         return records
+
+    def _map_stage(self, items, function, consume):
+        """Process independent stage items with bounded workers and stable order."""
+        def execute(item):
+            self._check_stop()
+            try:
+                return function(item)
+            except BaseException:
+                self.stop_event.set()
+                raise
+        with ThreadPoolExecutor(max_workers=self.config.problem_concurrency) as executor:
+            try:
+                for value in executor.map(execute, items):
+                    consume(value)
+            except BaseException:
+                # Queued work stops before new paid calls. Admitted calls settle
+                # and independently verified exports keep their own checkpoints.
+                self.stop_event.set()
+                raise
 
     def embeddings(self, library: dict, directory: Path):
         import numpy as np
@@ -545,14 +601,18 @@ class Pipeline:
         from dreamprover.learning.filtering import filter_candidates, deduplicate_candidates
         from dreamprover.learning.prove import prove_candidates
         from dreamprover.learning.update import update_library
-        final = directory / "library" / "full_library.json"
-        if final.exists() and (directory / "complete.json").exists():
-            return _read(final)
+        completed = load_cycle_library(directory)
+        if completed is not None:
+            return completed
         annotations = _read(directory / "annotations.json", {})
-        for name, record in experiences.items():
-            if name not in annotations:
-                annotations.update(annotate_library({name: record}, self.complete(f"cycles/cycle_{cycle:02d}/annotation/{name}", parse_description)))
-                atomic_json(directory / "annotations.json", annotations)
+        pending_annotations = [(name, record) for name, record in experiences.items() if name not in annotations]
+        def annotate(item):
+            name, record = item
+            return annotate_library({name: record}, self.complete(f"cycles/cycle_{cycle:02d}/annotation/{name}", parse_description))
+        def save_annotation(value):
+            annotations.update(value)
+            atomic_json(directory / "annotations.json", annotations)
+        self._map_stage(pending_annotations, annotate, save_annotation)
         proposals = _read(directory / "proposals.json")
         if proposals is None:
             if annotations:
@@ -613,16 +673,27 @@ class Pipeline:
         atomic_json(directory / "complete.json", dict(cycle=cycle, library_sha256=fingerprint(updated)))
         return updated
 
-    def train_run(self):
+    def load_cycle_library(self, cycle: int):
+        if not 1 <= cycle <= self.config.cycles:
+            raise ValueError("Cycle must be within the configured training range")
+        library = load_cycle_library(self.root / "cycles" / f"cycle_{cycle:02d}")
+        if library is None:
+            raise ValueError(f"Cycle {cycle} has not completed")
+        return library
+
+    def train_run(self, *, stop_after_cycle=None):
+        last_cycle = self.config.cycles if stop_after_cycle is None else stop_after_cycle
+        if not isinstance(last_cycle, int) or isinstance(last_cycle, bool) or not 1 <= last_cycle <= self.config.cycles:
+            raise ValueError("stop_after_cycle must be within the configured training range")
         self._status("training", "running")
         library = {}
         try:
-            for cycle in range(1, self.config.cycles + 1):
+            for cycle in range(1, last_cycle + 1):
                 self._check_stop()
                 directory = self.root / "cycles" / f"cycle_{cycle:02d}"
-                finished = directory / "library" / "full_library.json"
-                if finished.exists() and (directory / "complete.json").exists():
-                    library = _read(finished)
+                completed = load_cycle_library(directory)
+                if completed is not None:
+                    library = completed
                     continue
                 directory.mkdir(parents=True, exist_ok=True)
                 atomic_json(directory / "input_library.json", library)
@@ -633,6 +704,10 @@ class Pipeline:
                 library = self.sleep_cycle(cycle, directory, library, experiences)
                 assert_disjoint(self.train, load_problems(self.config.eval_data, seed=self.config.seed), library)
             self._check_stop()
+            if last_cycle < self.config.cycles:
+                self._status("training", "cycle_complete", completed_cycles=last_cycle,
+                             planned_cycles=self.config.cycles, library_size=len(library))
+                return _read(self.root / "status.json")
             atomic_json(self.root / "final_library.json", library)
             if library:
                 (self.root / "final_library.lean").write_text(library_lean_source(library))
@@ -641,6 +716,10 @@ class Pipeline:
             self._status("training", "budget_exhausted", reason=str(exc))
         except RunStopped as exc:
             self._status("training", "stopped", reason=str(exc))
+        except VerificationInfrastructureError as exc:
+            self._status("training", "infrastructure_failed", error_type=type(exc).__name__,
+                         reason=exc.diagnostic, resumable=True)
+            raise
         except Exception as exc:
             self._status("training", "failed", error_type=type(exc).__name__, reason=str(exc))
             raise
@@ -803,7 +882,11 @@ def command_line(phase: str, argv=None):
                    "direct_attempts", "corrections", "wake_sketch_attempts", "inference_sketch_attempts", "seed"):
         parser.add_argument("--" + option.replace("_", "-"), type=int)
     parser.add_argument("--max-cost-usd", type=float)
+    if phase == "training":
+        parser.add_argument("--stop-after-cycle", type=int,
+                            help="Finish this cycle without changing the configured experiment")
     args = vars(parser.parse_args(argv))
+    stop_after_cycle = args.pop("stop_after_cycle", None)
     config_path = args.pop("config").expanduser().resolve()
     if not config_path.is_file():
         parser.error(f"Configuration not found: {config_path}")
@@ -818,7 +901,7 @@ def command_line(phase: str, argv=None):
             try:
                 with run_lock(config.output_dir):
                     pipeline = Pipeline(config, phase=phase, stop_event=stop_event)
-                    result = pipeline.train_run() if phase == "training" else pipeline.evaluate_run()
+                    result = pipeline.train_run(stop_after_cycle=stop_after_cycle) if phase == "training" else pipeline.evaluate_run()
             except BaseException as exc:
                 # A concurrent transport failure still uses the requested signal
                 # exit code once current work and its cleanup have drained.

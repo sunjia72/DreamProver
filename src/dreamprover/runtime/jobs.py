@@ -5,8 +5,18 @@
 import asyncio
 import logging
 from dreamprover.runtime.tracking import MaxLLMCallsExceeded
+from dreamprover.runtime.budget import RunStopped
+from dreamprover.lean.proof import VerificationInfrastructureError
 
 logger = logging.getLogger(__name__)
+
+FATAL_EXCEPTIONS = (MaxLLMCallsExceeded, VerificationInfrastructureError, RunStopped)
+
+
+def raise_if_fatal(result):
+    """Keep interruptions out of ordinary unsuccessful proof results."""
+    if isinstance(result, FATAL_EXCEPTIONS):
+        raise result
 
 
 class AsyncJobPool:
@@ -21,6 +31,17 @@ class AsyncJobPool:
         if isinstance(result, BaseException):
             return True
         return not (result[0] if isinstance(result, tuple) and result else result)
+
+    @staticmethod
+    def _check_completed_interruptions(tasks):
+        # Check the whole completed batch before returning an ordinary result.
+        # Set iteration order must not hide an interrupted verifier or budget.
+        for task in tasks:
+            if not task.cancelled():
+                error = task.exception()
+                raise_if_fatal(error)
+                if error is None:
+                    raise_if_fatal(task.result())
 
     async def _run(self, coro, args, kwargs):
         if self.semaphore is None:
@@ -49,10 +70,11 @@ class AsyncJobPool:
         try:
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                self._check_completed_interruptions(done)
                 for task in done:
                     try:
                         result = task.result()
-                    except MaxLLMCallsExceeded:
+                    except FATAL_EXCEPTIONS:
                         raise
                     except asyncio.CancelledError:
                         continue
@@ -69,6 +91,8 @@ class AsyncJobPool:
         tasks = list(self.tasks)
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                raise_if_fatal(result)
             return [(task.get_name(), result) for task, result in zip(tasks, results)]
         finally:
             await self._cleanup()
@@ -82,10 +106,11 @@ class AsyncJobPool:
         try:
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                self._check_completed_interruptions(done)
                 for task in done:
                     try:
                         result = task.result()
-                    except MaxLLMCallsExceeded:
+                    except FATAL_EXCEPTIONS:
                         raise
                     except (Exception, asyncio.CancelledError) as exc:
                         return [(task.get_name(), exc)]
@@ -101,10 +126,11 @@ class AsyncJobPool:
         try:
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                self._check_completed_interruptions(done)
                 for task in done:
                     try:
                         results[task] = task.result()
-                    except MaxLLMCallsExceeded:
+                    except FATAL_EXCEPTIONS:
                         raise
                     except (Exception, asyncio.CancelledError) as exc:
                         results[task] = exc
