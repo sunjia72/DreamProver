@@ -1,0 +1,12 @@
+{
+  "tbps": {
+    "url": "https://github.com/imathwy/tbps.git",
+    "revision": "306e496939cecc24e599ec611abf89eb5e7f1dfa",
+    "path": "vendor/tbps"
+  },
+  "kimina": {
+    "url": "https://github.com/project-numina/kimina-lean-server.git",
+    "revision": "fb2393de3461db35eda4c714e3fd21187e92ec90",
+    "path": "vendor/kimina-lean-server"
+  }
+}

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dreamprover"
+version = "0.1.0"
+description = "Wake-sleep lemma library learning and Lean 4 theorem proving"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "hydra-core>=1.3,<1.4", "omegaconf>=2.3,<2.4", "openai>=1.60,<3",
+  "httpx>=0.27,<1", "kimina-client==0.2.1", "requests>=2.31,<3",
+  "PyYAML>=6,<7", "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+retrieval = ["sentence-transformers>=3,<6", "faiss-cpu>=1.8,<2", "numpy>=1.26,<3"]
+sleep = ["sentence-transformers>=3,<6", "scikit-learn>=1.4,<2", "numpy>=1.26,<3", "zss>=1.2,<2"]
+data = ["pyarrow>=17,<30"]
+tbps = ["fastapi>=0.116,<1", "uvicorn>=0.30,<1", "psycopg2-binary>=2.9,<3", "numpy>=1.26,<3", "zss>=1.2,<2"]
+lint = ["ruff>=0.8,<1"]
+
+[project.scripts]
+dreamprover = "dreamprover.cli:main"
+dreamprover-doctor = "dreamprover.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dreamprover*"]
+
+[tool.ruff]
+target-version = "py310"
+cache-dir = "artifacts/cache/ruff"
+exclude = [".venv", "artifacts", "data", "runs", "vendor"]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]

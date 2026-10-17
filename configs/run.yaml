@@ -1,0 +1,11 @@
+# load configs
+defaults:
+ - experiment: dreamprover
+ - data: neq_test
+ - _self_
+
+results_dir: runs/
+
+hydra:
+  run:
+    dir: runs/hydra/${now:%Y-%m-%d_%H-%M-%S}
